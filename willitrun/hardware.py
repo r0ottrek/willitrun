@@ -1,0 +1,391 @@
+"""Hardware detection and a lookup table of memory bandwidth.
+
+Decode speed for a local LLM is limited mostly by memory bandwidth, not
+compute: every generated token streams the active weights through the chip
+once. So we need two numbers per memory pool: how big it is and how fast it is.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import glob
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass, field
+
+GB = 1e9
+
+
+@dataclass(frozen=True)
+class GpuSpec:
+    vram_gb: float
+    bw_gbs: float
+    unified: bool = False
+
+
+# name fragment (lowercase) -> spec. Longer fragments are matched first.
+GPU_TABLE: dict[str, GpuSpec] = {
+    # NVIDIA GeForce, desktop
+    "rtx 5090": GpuSpec(32, 1792), "rtx 5080": GpuSpec(16, 960),
+    "rtx 5070 ti": GpuSpec(16, 896), "rtx 5070": GpuSpec(12, 672),
+    "rtx 5060 ti": GpuSpec(16, 448), "rtx 5060": GpuSpec(8, 448),
+    "rtx 4090": GpuSpec(24, 1008), "rtx 4080 super": GpuSpec(16, 736),
+    "rtx 4080": GpuSpec(16, 717), "rtx 4070 ti super": GpuSpec(16, 672),
+    "rtx 4070 ti": GpuSpec(12, 504), "rtx 4070 super": GpuSpec(12, 504),
+    "rtx 4070": GpuSpec(12, 504), "rtx 4060 ti": GpuSpec(16, 288),
+    "rtx 4060": GpuSpec(8, 272), "rtx 3090 ti": GpuSpec(24, 1008),
+    "rtx 3090": GpuSpec(24, 936), "rtx 3080 ti": GpuSpec(12, 912),
+    "rtx 3080": GpuSpec(10, 760), "rtx 3070 ti": GpuSpec(8, 608),
+    "rtx 3070": GpuSpec(8, 448), "rtx 3060 ti": GpuSpec(8, 448),
+    "rtx 3060": GpuSpec(12, 360), "rtx 2080 ti": GpuSpec(11, 616),
+    # NVIDIA laptop parts share names with desktop cards but are much slower
+    "rtx 5090 laptop": GpuSpec(24, 896), "rtx 5080 laptop": GpuSpec(16, 896),
+    "rtx 4090 laptop": GpuSpec(16, 576), "rtx 4080 laptop": GpuSpec(12, 432),
+    "rtx 4070 laptop": GpuSpec(8, 256), "rtx 4060 laptop": GpuSpec(8, 256),
+    "rtx 4050 laptop": GpuSpec(6, 192), "rtx 3080 laptop": GpuSpec(16, 448),
+    "rtx 3070 laptop": GpuSpec(8, 448), "rtx 3060 laptop": GpuSpec(6, 336),
+    # NVIDIA workstation / datacenter
+    "rtx pro 6000": GpuSpec(96, 1792), "rtx 6000 ada": GpuSpec(48, 960),
+    "rtx a6000": GpuSpec(48, 768), "a100 80gb": GpuSpec(80, 2039),
+    "a100": GpuSpec(40, 1555), "h100": GpuSpec(80, 3350), "l40s": GpuSpec(48, 864),
+    "a10": GpuSpec(24, 600), "l4": GpuSpec(24, 300), "t4": GpuSpec(16, 320),
+    "v100": GpuSpec(16, 900), "p40": GpuSpec(24, 346),
+    "gb10": GpuSpec(128, 273, unified=True), "dgx spark": GpuSpec(128, 273, unified=True),
+    # AMD Radeon
+    "rx 9070 xt": GpuSpec(16, 640), "rx 9070": GpuSpec(16, 640),
+    "rx 7900 xtx": GpuSpec(24, 960), "rx 7900 xt": GpuSpec(20, 800),
+    "rx 7900 gre": GpuSpec(16, 576), "rx 7800 xt": GpuSpec(16, 624),
+    "rx 7700 xt": GpuSpec(12, 432), "rx 7600": GpuSpec(8, 288),
+    "rx 6900 xt": GpuSpec(16, 512), "rx 6800 xt": GpuSpec(16, 512),
+    "pro w7900": GpuSpec(48, 864), "mi300x": GpuSpec(192, 5300),
+    "ryzen ai max": GpuSpec(128, 256, unified=True),
+    # Intel Arc
+    "arc b580": GpuSpec(12, 456), "arc a770": GpuSpec(16, 560),
+}
+
+# Apple Silicon unified memory bandwidth, GB/s. Some chips come in two
+# bandwidth bins; the RAM size tells them apart (see apple_bandwidth).
+APPLE_BW = {
+    "m1": 68, "m1 pro": 200, "m1 max": 400, "m1 ultra": 800,
+    "m2": 100, "m2 pro": 200, "m2 max": 400, "m2 ultra": 800,
+    "m3": 100, "m3 pro": 150, "m3 max": 400, "m3 ultra": 819,
+    "m4": 120, "m4 pro": 273, "m4 max": 546,
+    "m5": 153,
+}
+
+
+def apple_bandwidth(chip: str, ram_gb: float) -> float | None:
+    key = chip.lower().replace("apple", "").strip()
+    if key == "m3 max" and ram_gb <= 36:
+        return 300  # 14-core M3 Max
+    if key == "m4 max" and ram_gb <= 36:
+        return 410  # 14-core M4 Max
+    return APPLE_BW.get(key)
+
+
+def lookup_gpu(name: str) -> GpuSpec | None:
+    n = name.lower()
+    laptop = "laptop" in n or "mobile" in n or "max-q" in n
+    n = n.replace("geforce", "").replace("nvidia", "").replace("amd", "").replace("radeon", "")
+    n = re.sub(r"\s+", " ", n).strip()
+    for frag in sorted(GPU_TABLE, key=len, reverse=True):
+        if "laptop" in frag and not laptop:
+            continue
+        if frag in n:
+            return GPU_TABLE[frag]
+    return None
+
+
+@dataclass
+class Gpu:
+    name: str
+    vram_gb: float
+    bw_gbs: float | None
+    bw_known: bool = True
+
+
+@dataclass
+class Machine:
+    os: str
+    cpu: str
+    ram_gb: float
+    ram_bw_gbs: float
+    gpus: list[Gpu] = field(default_factory=list)
+    unified: bool = False          # Apple Silicon, Strix Halo, DGX Spark
+    unified_gpu_limit_gb: float | None = None
+    apple_chip: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def vram_gb(self) -> float:
+        return sum(g.vram_gb for g in self.gpus)
+
+    @property
+    def gpu_bw_gbs(self) -> float | None:
+        # Layers split across GPUs run one after another, so the effective
+        # bandwidth is the slowest card's.
+        bws = [g.bw_gbs for g in self.gpus if g.bw_gbs]
+        return min(bws) if bws else None
+
+    def describe(self) -> str:
+        if self.unified:
+            return f"{self.cpu}, {self.ram_gb:.0f} GB unified memory"
+        parts = [self.cpu, f"{self.ram_gb:.0f} GB RAM"]
+        for g in self.gpus:
+            parts.append(f"{g.name} ({g.vram_gb:.0f} GB)")
+        return ", ".join(parts)
+
+
+def _run(cmd: list[str], timeout: float = 5) -> str | None:
+    if not shutil.which(cmd[0]):
+        return None
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _ram_gb() -> float:
+    system = platform.system()
+    if system == "Darwin":
+        out = _run(["sysctl", "-n", "hw.memsize"])
+        if out:
+            return int(out.strip()) / GB
+    if system == "Linux":
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) * 1024 / GB
+        except OSError:
+            pass
+    if system == "Windows":
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):  # type: ignore[attr-defined]
+            return stat.ullTotalPhys / GB
+    return 16.0
+
+
+def _cpu_name() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        out = _run(["sysctl", "-n", "machdep.cpu.brand_string"])
+        if out:
+            return out.strip()
+    if system == "Linux":
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.lower().startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+    return platform.processor() or platform.machine() or "Unknown CPU"
+
+
+def _nvidia_gpus() -> list[Gpu]:
+    out = _run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+    gpus: list[Gpu] = []
+    for line in (out or "").strip().splitlines():
+        name, _, mem = line.rpartition(",")
+        name = name.strip()
+        spec = lookup_gpu(name)
+        try:
+            vram = float(mem.strip()) * 1024 * 1024 / GB  # MiB -> GB
+        except ValueError:
+            vram = spec.vram_gb if spec else 0.0
+        gpus.append(Gpu(name, vram, spec.bw_gbs if spec else None, spec is not None))
+    return gpus
+
+
+def _amd_gpus_linux() -> list[Gpu]:
+    gpus: list[Gpu] = []
+    names: list[str] = []
+    out = _run(["rocm-smi", "--showproductname", "--json"])
+    if out:
+        try:
+            for card in json.loads(out).values():
+                names.append(card.get("Card Series") or card.get("Card series") or "AMD GPU")
+        except (ValueError, AttributeError):
+            pass
+    for i, path in enumerate(sorted(glob.glob("/sys/class/drm/card*/device/mem_info_vram_total"))):
+        try:
+            with open(path) as f:
+                vram = int(f.read().strip()) / GB
+        except (OSError, ValueError):
+            continue
+        if vram < 2:  # integrated GPU carve-out, not a real card
+            continue
+        name = names[i] if i < len(names) else "AMD GPU"
+        spec = lookup_gpu(name)
+        gpus.append(Gpu(name, vram, spec.bw_gbs if spec else None, spec is not None))
+    return gpus
+
+
+def apple_gpu_limit(ram_gb: float) -> float:
+    """macOS lets the GPU wire about 2/3 of RAM (3/4 above 36 GB) by default."""
+    return ram_gb * (0.75 if ram_gb > 36 else 0.67)
+
+
+DEFAULT_RAM_BW = 80.0   # dual-channel DDR5-5000ish; DDR4 desktops are closer to 50
+
+
+def _ram_speed() -> tuple[float, str] | None:
+    """Peak RAM bandwidth from DIMM speed, when the OS will tell us.
+
+    Consumer boards run two 64-bit channels, so we count at most two DIMMs.
+    """
+    system = platform.system()
+    speeds: list[int] = []
+    kind = ""
+    if system == "Linux":
+        out = _run(["dmidecode", "-t", "17"])  # needs root; silently skipped otherwise
+        for line in (out or "").splitlines():
+            line = line.strip()
+            m = re.match(r"Configured (?:Memory|Clock) Speed: (\d+) MT/s", line)
+            if m:
+                speeds.append(int(m.group(1)))
+            m = re.match(r"Type: (DDR\d|LPDDR\d\w?)", line)
+            if m:
+                kind = m.group(1)
+    elif system == "Windows":
+        out = _run(["powershell", "-NoProfile", "-Command",
+                    "Get-CimInstance Win32_PhysicalMemory | ForEach-Object { $_.ConfiguredClockSpeed }"])
+        speeds = [int(x) for x in (out or "").split() if x.isdigit() and int(x) > 0]
+    if not speeds:
+        return None
+    channels = min(len(speeds), 2)
+    return min(speeds) * 8 * channels / 1000, kind
+
+
+def detect() -> Machine:
+    system = platform.system()
+    ram = _ram_gb()
+    cpu = _cpu_name()
+    m = Machine(os=system, cpu=cpu, ram_gb=ram, ram_bw_gbs=DEFAULT_RAM_BW)
+
+    chip = re.search(r"Apple (M\d(?: (?:Pro|Max|Ultra))?)", cpu)
+    if system == "Darwin" and chip:
+        return apple_machine(chip.group(1), ram, m)
+
+    unified = lookup_gpu(cpu)
+    if unified and unified.unified:  # e.g. Ryzen AI Max (Strix Halo)
+        m.unified = True
+        m.ram_bw_gbs = unified.bw_gbs
+        m.unified_gpu_limit_gb = ram * 0.75
+        m.gpus = [Gpu(f"{cpu} iGPU", 0, unified.bw_gbs)]
+        m.notes.append("Unified memory: the GPU share is set in BIOS/driver; assumed 75% of RAM.")
+        return m
+
+    m.gpus = _nvidia_gpus()
+    if any(lookup_gpu(g.name) and lookup_gpu(g.name).unified for g in m.gpus):  # DGX Spark
+        spec = lookup_gpu(m.gpus[0].name)
+        m.unified = True
+        m.ram_bw_gbs = spec.bw_gbs
+        m.unified_gpu_limit_gb = ram * 0.9
+        m.gpus = [Gpu(m.gpus[0].name, 0, spec.bw_gbs)]
+        return m
+    if not m.gpus and system == "Linux":
+        m.gpus = _amd_gpus_linux()
+    speed = _ram_speed()
+    if speed:
+        m.ram_bw_gbs = speed[0]
+    else:
+        m.notes.append(f"RAM speed unknown, assumed {DEFAULT_RAM_BW:.0f} GB/s (dual-channel DDR5). "
+                       "Use --ram-bw 50 for DDR4.")
+    for g in m.gpus:
+        if not g.bw_known:
+            g.bw_gbs = 400.0
+            m.notes.append(f"Unknown bandwidth for '{g.name}', assumed 400 GB/s. Pass --gpu-bw to fix.")
+    return m
+
+
+def apple_machine(chip: str, ram: float, base: Machine | None = None) -> Machine:
+    bw = apple_bandwidth(chip, ram) or 100.0
+    m = base or Machine(os="Darwin", cpu=f"Apple {chip}", ram_gb=ram, ram_bw_gbs=bw)
+    m.cpu = f"Apple {chip}"
+    m.unified = True
+    m.apple_chip = chip
+    m.ram_bw_gbs = bw
+    m.unified_gpu_limit_gb = apple_gpu_limit(ram)
+    m.gpus = [Gpu(f"Apple {chip} GPU", 0, bw)]
+    return m
+
+
+def manual(gpu: str | None, ram_gb: float | None, vram_gb: float | None,
+           gpu_bw: float | None, ram_bw: float | None, gpu_count: int = 1,
+           base: Machine | None = None) -> Machine:
+    """Build a hypothetical (or corrected) machine from CLI flags."""
+    m = base or detect()
+    if ram_gb:
+        m.ram_gb = ram_gb
+    if gpu:
+        if gpu.lower() in ("none", "cpu"):
+            m.gpus, m.unified, m.unified_gpu_limit_gb = [], False, None
+        else:
+            chip = re.fullmatch(r"(?:apple )?(m\d(?: (?:pro|max|ultra))?)", gpu.strip().lower())
+            if chip:
+                words = chip.group(1).split()
+                name = " ".join([words[0].upper()] + [w.capitalize() for w in words[1:]])
+                m = apple_machine(name, m.ram_gb, m)
+                m.notes = []
+            else:
+                spec = lookup_gpu(gpu)
+                if spec and spec.unified:
+                    m.unified = True
+                    m.ram_bw_gbs = spec.bw_gbs
+                    if not ram_gb:
+                        m.ram_gb = spec.vram_gb
+                    m.unified_gpu_limit_gb = m.ram_gb * 0.75
+                    m.gpus = [Gpu(gpu, 0, spec.bw_gbs)]
+                    m.cpu = gpu
+                else:
+                    m.unified, m.unified_gpu_limit_gb = False, None
+                    vram = vram_gb or (spec.vram_gb if spec else 0)
+                    bw = gpu_bw or (spec.bw_gbs if spec else 400.0)
+                    m.gpus = [Gpu(gpu, vram, bw, spec is not None) for _ in range(gpu_count)]
+                    m.notes = [n for n in m.notes if "Unknown bandwidth" not in n]
+                    if not spec and not gpu_bw:
+                        m.notes.append(f"Unknown GPU '{gpu}', assumed 400 GB/s. Pass --gpu-bw to fix.")
+    if vram_gb and m.gpus and not m.unified:
+        for g in m.gpus:
+            g.vram_gb = vram_gb
+    if gpu_bw:
+        for g in m.gpus:
+            g.bw_gbs = gpu_bw
+        if m.unified:
+            m.ram_bw_gbs = gpu_bw
+    if ram_bw and not m.unified:
+        m.ram_bw_gbs = ram_bw
+    if ram_bw or m.unified:
+        m.notes = [n for n in m.notes if not n.startswith("RAM speed unknown")]
+    if m.unified and m.apple_chip and ram_gb:
+        m.unified_gpu_limit_gb = apple_gpu_limit(m.ram_gb)
+    elif m.unified and ram_gb:
+        m.unified_gpu_limit_gb = m.ram_gb * 0.75
+    return m
+
+
+def env_overrides() -> dict[str, float]:
+    """WILLITRUN_GPU_BW etc. let people pin corrections without retyping flags."""
+    out = {}
+    for key in ("GPU_BW", "RAM_BW"):
+        val = os.environ.get(f"WILLITRUN_{key}")
+        if val:
+            try:
+                out[key.lower()] = float(val)
+            except ValueError:
+                pass
+    return out

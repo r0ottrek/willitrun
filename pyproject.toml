@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "willitrun"
+dynamic = ["version"]
+description = "Which open LLMs will run well on your machine, at what quantization and speed? Context-aware, MoE-aware, zero dependencies."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+keywords = ["llm", "local-llm", "ollama", "llama.cpp", "gguf", "quantization", "vram", "apple-silicon"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+willitrun = "willitrun.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "willitrun.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["willitrun*"]
