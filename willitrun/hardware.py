@@ -15,9 +15,11 @@ import platform
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-GB = 1e9
+# Memory sizes are in GiB throughout, because that is what "24 GB" on a GPU
+# box or "36 GB" on a Mac really means. Bandwidth stays in decimal GB/s.
+GB = 2 ** 30
 
 
 @dataclass(frozen=True)
@@ -39,11 +41,13 @@ GPU_TABLE: dict[str, GpuSpec] = {
     "rtx 4070": GpuSpec(12, 504), "rtx 4060 ti": GpuSpec(16, 288),
     "rtx 4060": GpuSpec(8, 272), "rtx 3090 ti": GpuSpec(24, 1008),
     "rtx 3090": GpuSpec(24, 936), "rtx 3080 ti": GpuSpec(12, 912),
-    "rtx 3080": GpuSpec(10, 760), "rtx 3070 ti": GpuSpec(8, 608),
+    "rtx 3080": GpuSpec(10, 760), "rtx 3080 12gb": GpuSpec(12, 912), "rtx 3070 ti": GpuSpec(8, 608),
     "rtx 3070": GpuSpec(8, 448), "rtx 3060 ti": GpuSpec(8, 448),
     "rtx 3060": GpuSpec(12, 360), "rtx 2080 ti": GpuSpec(11, 616),
     # NVIDIA laptop parts share names with desktop cards but are much slower
     "rtx 5090 laptop": GpuSpec(24, 896), "rtx 5080 laptop": GpuSpec(16, 896),
+    "rtx 5070 ti laptop": GpuSpec(12, 672), "rtx 5070 laptop": GpuSpec(8, 384),
+    "rtx 5060 laptop": GpuSpec(8, 384),
     "rtx 4090 laptop": GpuSpec(16, 576), "rtx 4080 laptop": GpuSpec(12, 432),
     "rtx 4070 laptop": GpuSpec(8, 256), "rtx 4060 laptop": GpuSpec(8, 256),
     "rtx 4050 laptop": GpuSpec(6, 192), "rtx 3080 laptop": GpuSpec(16, 448),
@@ -51,7 +55,8 @@ GPU_TABLE: dict[str, GpuSpec] = {
     # NVIDIA workstation / datacenter
     "rtx pro 6000": GpuSpec(96, 1792), "rtx 6000 ada": GpuSpec(48, 960),
     "rtx a6000": GpuSpec(48, 768), "a100 80gb": GpuSpec(80, 2039),
-    "a100": GpuSpec(40, 1555), "h100": GpuSpec(80, 3350), "l40s": GpuSpec(48, 864),
+    "a100": GpuSpec(40, 1555), "h100": GpuSpec(80, 3350), "h100 pcie": GpuSpec(80, 2000),
+    "l40s": GpuSpec(48, 864), "l40": GpuSpec(48, 864),
     "a10": GpuSpec(24, 600), "l4": GpuSpec(24, 300), "t4": GpuSpec(16, 320),
     "v100": GpuSpec(16, 900), "p40": GpuSpec(24, 346),
     "gb10": GpuSpec(128, 273, unified=True), "dgx spark": GpuSpec(128, 273, unified=True),
@@ -77,6 +82,15 @@ APPLE_BW = {
     "m5": 153,
 }
 
+# Largest memory each chip was sold with, so the upgrade advisor only
+# suggests Macs that exist.
+APPLE_MAX_RAM = {
+    "m1": 16, "m1 pro": 32, "m1 max": 64, "m1 ultra": 128,
+    "m2": 24, "m2 pro": 32, "m2 max": 96, "m2 ultra": 192,
+    "m3": 24, "m3 pro": 36, "m3 max": 128, "m3 ultra": 512,
+    "m4": 32, "m4 pro": 64, "m4 max": 128, "m5": 32,
+}
+
 
 def apple_bandwidth(chip: str, ram_gb: float) -> float | None:
     key = chip.lower().replace("apple", "").strip()
@@ -87,17 +101,41 @@ def apple_bandwidth(chip: str, ram_gb: float) -> float | None:
     return APPLE_BW.get(key)
 
 
-def lookup_gpu(name: str) -> GpuSpec | None:
+# "rtx 4060" must not match "RTX 4060 Ti", nor "rx 7900 xt" match "RX 7900 XTX".
+SUFFIX_GUARD = r"(?![a-z0-9])(?!\s+(?:ti|super|xt|xtx|gre)\b)"
+LAPTOP_MARKERS = re.compile(r"\b(laptop gpu|laptop|mobile|with max-q design|max-q|max-p)\b")
+
+
+def lookup_gpu(name: str, vram_gb: float | None = None) -> GpuSpec | None:
+    """Find a GPU by name. Matches whole words, so "A1000" is not an "A100".
+
+    When several entries match (rocm-smi says "RX 7900 XT/7900 XTX", or the
+    3080 that came with 10 or 12 GB), the detected VRAM picks the right one.
+    """
     n = name.lower()
-    laptop = "laptop" in n or "mobile" in n or "max-q" in n
-    n = n.replace("geforce", "").replace("nvidia", "").replace("amd", "").replace("radeon", "")
-    n = re.sub(r"\s+", " ", n).strip()
+    laptop = bool(LAPTOP_MARKERS.search(n))
+    n = LAPTOP_MARKERS.sub(" ", n)
+    n = re.sub(r"\b(geforce|nvidia|amd|radeon|graphics|\(r\)|\(tm\))\b", " ", n)
+    n = re.sub(r"[\s/\[\]]+", " ", n).strip() + (" laptop" if laptop else "")
+    hits = []
     for frag in sorted(GPU_TABLE, key=len, reverse=True):
         if "laptop" in frag and not laptop:
             continue
-        if frag in n:
-            return GPU_TABLE[frag]
-    return None
+        words = frag.split()
+        forms = [frag]
+        if len(words) > 1 and words[0] in ("rtx", "rx", "arc") and words[0] in n.split():
+            forms.append(" ".join(words[1:]))   # "RX 7900 XT/7900 XTX" names two cards
+        if any(re.search(r"(?<![a-z0-9])" + re.escape(f) + SUFFIX_GUARD, n) for f in forms):
+            hits.append(frag)
+    if not hits:
+        return None
+    if laptop and any("laptop" in h for h in hits):
+        hits = [h for h in hits if "laptop" in h]   # a laptop part with its own entry
+    if vram_gb:  # same name, more memory: "rtx 3080" -> "rtx 3080 12gb"
+        hits += [f"{h} {round(vram_gb)}gb" for h in hits if f"{h} {round(vram_gb)}gb" in GPU_TABLE]
+    if vram_gb and len(hits) > 1:
+        return GPU_TABLE[min(hits, key=lambda f: (abs(GPU_TABLE[f].vram_gb - vram_gb), -len(f)))]
+    return GPU_TABLE[hits[0]]
 
 
 @dataclass
@@ -138,6 +176,10 @@ class Machine:
         for g in self.gpus:
             parts.append(f"{g.name} ({g.vram_gb:.0f} GB)")
         return ", ".join(parts)
+
+    def to_cpu_only(self) -> None:
+        self.gpus, self.unified, self.unified_gpu_limit_gb, self.apple_chip = [], False, None, None
+        self.ram_bw_gbs = DEFAULT_RAM_BW
 
 
 def _run(cmd: list[str], timeout: float = 5) -> str | None:
@@ -192,6 +234,14 @@ def _cpu_name() -> str:
                         return line.split(":", 1)[1].strip()
         except OSError:
             pass
+    if system == "Windows":
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                 r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+            return str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).strip()
+        except (ImportError, OSError):
+            pass
     return platform.processor() or platform.machine() or "Unknown CPU"
 
 
@@ -201,10 +251,12 @@ def _nvidia_gpus() -> list[Gpu]:
     for line in (out or "").strip().splitlines():
         name, _, mem = line.rpartition(",")
         name = name.strip()
-        spec = lookup_gpu(name)
         try:
-            vram = float(mem.strip()) * 1024 * 1024 / GB  # MiB -> GB
+            vram = float(mem.strip()) / 1024  # MiB -> GiB
         except ValueError:
+            vram = None  # "[N/A]" on some unified-memory parts
+        spec = lookup_gpu(name, vram)
+        if vram is None:
             vram = spec.vram_gb if spec else 0.0
         gpus.append(Gpu(name, vram, spec.bw_gbs if spec else None, spec is not None))
     return gpus
@@ -229,17 +281,24 @@ def _amd_gpus_linux() -> list[Gpu]:
         if vram < 2:  # integrated GPU carve-out, not a real card
             continue
         name = names[i] if i < len(names) else "AMD GPU"
-        spec = lookup_gpu(name)
+        spec = lookup_gpu(name, vram)
         gpus.append(Gpu(name, vram, spec.bw_gbs if spec else None, spec is not None))
     return gpus
 
 
 def apple_gpu_limit(ram_gb: float) -> float:
     """macOS lets the GPU wire about 2/3 of RAM (3/4 above 36 GB) by default."""
-    return ram_gb * (0.75 if ram_gb > 36 else 0.67)
+    return ram_gb * (0.75 if ram_gb > 36.5 else 0.67)
 
 
 DEFAULT_RAM_BW = 80.0   # dual-channel DDR5-5000ish; DDR4 desktops are closer to 50
+UNIFIED_SHARE = 0.75    # Strix Halo: GPU share of RAM, set in BIOS / driver
+SPARK_SHARE = 0.9       # DGX Spark's GPU can use nearly all of its memory
+
+
+def unified_share(name: str) -> float:
+    n = name.lower()
+    return SPARK_SHARE if ("gb10" in n or "spark" in n) else UNIFIED_SHARE
 
 
 def _ram_speed() -> tuple[float, str] | None:
@@ -284,7 +343,7 @@ def detect() -> Machine:
     if unified and unified.unified:  # e.g. Ryzen AI Max (Strix Halo)
         m.unified = True
         m.ram_bw_gbs = unified.bw_gbs
-        m.unified_gpu_limit_gb = ram * 0.75
+        m.unified_gpu_limit_gb = ram * UNIFIED_SHARE
         m.gpus = [Gpu(f"{cpu} iGPU", 0, unified.bw_gbs)]
         m.notes.append("Unified memory: the GPU share is set in BIOS/driver; assumed 75% of RAM.")
         return m
@@ -294,7 +353,7 @@ def detect() -> Machine:
         spec = lookup_gpu(m.gpus[0].name)
         m.unified = True
         m.ram_bw_gbs = spec.bw_gbs
-        m.unified_gpu_limit_gb = ram * 0.9
+        m.unified_gpu_limit_gb = ram * SPARK_SHARE
         m.gpus = [Gpu(m.gpus[0].name, 0, spec.bw_gbs)]
         return m
     if not m.gpus and system == "Linux":
@@ -303,8 +362,8 @@ def detect() -> Machine:
     if speed:
         m.ram_bw_gbs = speed[0]
     else:
-        m.notes.append(f"RAM speed unknown, assumed {DEFAULT_RAM_BW:.0f} GB/s (dual-channel DDR5). "
-                       "Use --ram-bw 50 for DDR4.")
+        m.notes.append(f"RAM speed unknown, assumed {DEFAULT_RAM_BW:.0f} GB/s (DDR5). "
+                       "For DDR4 add --ram-bw 50.")
     for g in m.gpus:
         if not g.bw_known:
             g.bw_gbs = 400.0
@@ -313,8 +372,13 @@ def detect() -> Machine:
 
 
 def apple_machine(chip: str, ram: float, base: Machine | None = None) -> Machine:
-    bw = apple_bandwidth(chip, ram) or 100.0
-    m = base or Machine(os="Darwin", cpu=f"Apple {chip}", ram_gb=ram, ram_bw_gbs=bw)
+    bw = apple_bandwidth(chip, ram)
+    m = base or Machine(os="Darwin", cpu=f"Apple {chip}", ram_gb=ram, ram_bw_gbs=bw or 100.0)
+    if bw is None:
+        bw = 100.0 * (4 if "max" in chip.lower() else 2 if "pro" in chip.lower() else 8
+                      if "ultra" in chip.lower() else 1.5)
+        m.notes.append(f"Bandwidth for the {chip} isn't in the table yet, assumed {bw:.0f} GB/s. "
+                       "Pass --gpu-bw to fix.")
     m.cpu = f"Apple {chip}"
     m.unified = True
     m.apple_chip = chip
@@ -322,6 +386,10 @@ def apple_machine(chip: str, ram: float, base: Machine | None = None) -> Machine
     m.unified_gpu_limit_gb = apple_gpu_limit(ram)
     m.gpus = [Gpu(f"Apple {chip} GPU", 0, bw)]
     return m
+
+
+class HardwareError(ValueError):
+    """A flag combination that can't describe a real machine."""
 
 
 def manual(gpu: str | None, ram_gb: float | None, vram_gb: float | None,
@@ -333,48 +401,80 @@ def manual(gpu: str | None, ram_gb: float | None, vram_gb: float | None,
         m.ram_gb = ram_gb
     if gpu:
         if gpu.lower() in ("none", "cpu"):
-            m.gpus, m.unified, m.unified_gpu_limit_gb = [], False, None
+            if vram_gb or gpu_count != 1:
+                raise HardwareError("--vram and --gpu-count don't apply with --gpu none.")
+            m.to_cpu_only()
+            m.notes = [] if ram_bw else [f"RAM speed assumed {DEFAULT_RAM_BW:.0f} GB/s (DDR5). "
+                                         "For DDR4 add --ram-bw 50."]
         else:
             chip = re.fullmatch(r"(?:apple )?(m\d(?: (?:pro|max|ultra))?)", gpu.strip().lower())
+            spec = None if chip else lookup_gpu(gpu, vram_gb)
+            if chip or (spec and spec.unified):
+                if gpu_count != 1:
+                    raise HardwareError("--gpu-count only applies to separate graphics cards.")
+                if vram_gb:
+                    raise HardwareError("Unified-memory machines have no separate VRAM. Use --ram.")
             if chip:
                 words = chip.group(1).split()
                 name = " ".join([words[0].upper()] + [w.capitalize() for w in words[1:]])
-                m = apple_machine(name, m.ram_gb, m)
                 m.notes = []
+                m = apple_machine(name, m.ram_gb, m)
+            elif spec and spec.unified:
+                m.to_cpu_only()
+                m.notes = []
+                m.unified = True
+                m.ram_bw_gbs = spec.bw_gbs
+                if not ram_gb:
+                    m.ram_gb = spec.vram_gb
+                m.unified_gpu_limit_gb = m.ram_gb * unified_share(gpu)
+                m.gpus = [Gpu(gpu, 0, spec.bw_gbs)]
+                m.cpu = gpu
             else:
-                spec = lookup_gpu(gpu)
-                if spec and spec.unified:
-                    m.unified = True
-                    m.ram_bw_gbs = spec.bw_gbs
-                    if not ram_gb:
-                        m.ram_gb = spec.vram_gb
-                    m.unified_gpu_limit_gb = m.ram_gb * 0.75
-                    m.gpus = [Gpu(gpu, 0, spec.bw_gbs)]
-                    m.cpu = gpu
-                else:
-                    m.unified, m.unified_gpu_limit_gb = False, None
-                    vram = vram_gb or (spec.vram_gb if spec else 0)
-                    bw = gpu_bw or (spec.bw_gbs if spec else 400.0)
-                    m.gpus = [Gpu(gpu, vram, bw, spec is not None) for _ in range(gpu_count)]
-                    m.notes = [n for n in m.notes if "Unknown bandwidth" not in n]
-                    if not spec and not gpu_bw:
-                        m.notes.append(f"Unknown GPU '{gpu}', assumed 400 GB/s. Pass --gpu-bw to fix.")
+                if not spec and not vram_gb:
+                    raise HardwareError(f"'{gpu}' isn't in the GPU table (see --list-gpus). "
+                                        "Add --vram and --gpu-bw for it.")
+                if m.unified or m.apple_chip:
+                    # A Mac or APU with a hypothetical card: RAM is ordinary system RAM now.
+                    cpu = m.cpu
+                    m.to_cpu_only()
+                    m.cpu = cpu
+                    m.notes = []
+                vram = vram_gb or spec.vram_gb
+                bw = gpu_bw or (spec.bw_gbs if spec else 400.0)
+                m.gpus = [Gpu(gpu, vram, bw, spec is not None) for _ in range(gpu_count)]
+                m.notes = [n for n in m.notes if "Unknown bandwidth" not in n]
+                if not spec and not gpu_bw:
+                    m.notes.append(f"Unknown GPU '{gpu}', assumed 400 GB/s. Pass --gpu-bw to fix.")
+    else:
+        if gpu_count != 1 and m.gpus and not m.unified:
+            m.gpus = [replace(m.gpus[0]) for _ in range(gpu_count)]
+        elif gpu_count != 1:
+            raise HardwareError("--gpu-count needs a graphics card. Add --gpu \"<name>\".")
+        if vram_gb and (not m.gpus or m.unified):
+            raise HardwareError("--vram needs a graphics card. Add --gpu \"<name>\" as well.")
     if vram_gb and m.gpus and not m.unified:
         for g in m.gpus:
             g.vram_gb = vram_gb
     if gpu_bw:
         for g in m.gpus:
             g.bw_gbs = gpu_bw
+            g.bw_known = True
         if m.unified:
             m.ram_bw_gbs = gpu_bw
+        m.notes = [n for n in m.notes if "assumed" not in n or "RAM speed" in n]
     if ram_bw and not m.unified:
         m.ram_bw_gbs = ram_bw
     if ram_bw or m.unified:
-        m.notes = [n for n in m.notes if not n.startswith("RAM speed unknown")]
+        m.notes = [n for n in m.notes if not n.startswith("RAM speed")]
     if m.unified and m.apple_chip and ram_gb:
         m.unified_gpu_limit_gb = apple_gpu_limit(m.ram_gb)
+        bw = apple_bandwidth(m.apple_chip, m.ram_gb)
+        if bw and not gpu_bw:
+            m.ram_bw_gbs = bw
+            for g in m.gpus:
+                g.bw_gbs = bw
     elif m.unified and ram_gb:
-        m.unified_gpu_limit_gb = m.ram_gb * 0.75
+        m.unified_gpu_limit_gb = m.ram_gb * unified_share(m.cpu)
     return m
 
 

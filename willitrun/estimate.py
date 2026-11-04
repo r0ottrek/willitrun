@@ -15,6 +15,10 @@ from dataclasses import dataclass, field
 from .catalog import QUANTS, QUANT_BY_NAME, RECOMMENDED_MIN_RANK, ModelSpec, Quant
 from .hardware import Machine
 
+# Sizes are GiB (what "24 GB" on a card means); bandwidth is decimal GB/s.
+GIB_BYTES = 2 ** 30
+GIB = GIB_BYTES / 1e9
+
 KV_BYTES = {"f16": 2.0, "q8_0": 1.0625, "q4_0": 0.5625}
 
 # Calibration constants (fitted to llama.cpp token-generation benchmarks).
@@ -70,19 +74,19 @@ class Fit:
     @property
     def where(self) -> str:
         return {
-            "gpu": "all on GPU",
+            "gpu": "on GPU",
             "unified": "unified memory",
-            "unified-raise": "unified (raise limit)",
-            "split": f"{round(self.gpu_fraction * 100)}% GPU / CPU",
-            "cpu": "CPU only",
-            "none": "-",
+            "unified-raise": "raise GPU limit",
+            "split": f"{round(self.gpu_fraction * 100)}% on GPU",
+            "cpu": "on CPU",
+            "none": "won't fit",
         }[self.placement]
 
 
 def kv_cache_gb(m: ModelSpec, ctx: int, kv_type: str = "f16") -> float:
     per_elem = KV_BYTES[kv_type]
     if m.kv_bytes_per_token:
-        return ctx * m.kv_bytes_per_token / 2.0 * per_elem / 1e9
+        return ctx * m.kv_bytes_per_token / 2.0 * per_elem / GIB_BYTES
     per_layer_token = 2 * m.kv_heads * m.head_dim * per_elem  # K and V
     if m.window:
         win, frac = m.window
@@ -91,15 +95,15 @@ def kv_cache_gb(m: ModelSpec, ctx: int, kv_type: str = "f16") -> float:
         tokens = glob * ctx + local * min(ctx, win)
     else:
         tokens = m.layers * ctx
-    return tokens * per_layer_token / 1e9
+    return tokens * per_layer_token / GIB_BYTES
 
 
 def weights_gb(m: ModelSpec, q: Quant | str) -> float:
     name = q if isinstance(q, str) else q.name
     if name in m.native:
-        return m.native[name]
+        return m.native[name] * 1e9 / GIB_BYTES   # file sizes are listed in decimal GB
     quant = QUANT_BY_NAME[name]
-    return m.params_b * quant.bpw / 8
+    return m.params_b * 1e9 * quant.bpw / 8 / GIB_BYTES
 
 
 def quants_for(m: ModelSpec) -> list[tuple[str, int]]:
@@ -120,9 +124,9 @@ def _ms_per_token(gpu_gb: float, cpu_gb: float, machine: Machine, moe: bool) -> 
     ms = 0.0
     if gpu_gb > 0:
         bw = machine.ram_bw_gbs if machine.unified else (machine.gpu_bw_gbs or 400)
-        ms += gpu_gb / (bw * _eff(machine) * penalty) * 1000 + PER_TOKEN_MS_GPU
+        ms += gpu_gb * GIB / (bw * _eff(machine) * penalty) * 1000 + PER_TOKEN_MS_GPU
     if cpu_gb > 0:
-        ms += cpu_gb / (machine.ram_bw_gbs * EFF_CPU * penalty) * 1000 + PER_TOKEN_MS_CPU
+        ms += cpu_gb * GIB / (machine.ram_bw_gbs * EFF_CPU * penalty) * 1000 + PER_TOKEN_MS_CPU
     return ms
 
 
@@ -154,7 +158,7 @@ def estimate(m: ModelSpec, quant: str, rank: int, machine: Machine,
     expert_active = (m.active - (m.shared_b or 0)) * bpp
 
     def speed(frac_gpu: float, kv_read: float) -> float:
-        if moe_split and frac_gpu < 1:
+        if moe_split and 0 < frac_gpu < 1:
             # Expert offload: attention + shared weights + KV stay on the GPU,
             # only the routed experts of some layers live in system RAM.
             gpu = shared_w + kv_read + expert_active * frac_gpu

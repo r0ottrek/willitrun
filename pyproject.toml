@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "willitrun"
 dynamic = ["version"]
-description = "Which open LLMs will run well on your machine, at what quantization and speed? Context-aware, MoE-aware, zero dependencies."
+description = "Which open LLMs will run on your machine, at what quantization and how fast. Context-aware, MoE-aware, no dependencies."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
@@ -29,3 +29,6 @@ version = { attr = "willitrun.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["willitrun*"]
+
+[tool.setuptools.package-data]
+willitrun = ["models.json"]
